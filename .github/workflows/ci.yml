@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Conn3x
+        env: &gh
+          GH_TOKEN: ${{ github.token }}
+        run: &install |
+          tag=$(gh release view -R conn3xorg/conn3x --json tagName -q .tagName)
+          file="conn3x_${tag#v}_linux_amd64.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/$file"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/checksums.txt"
+          grep " $file\$" checksums.txt | sha256sum -c -
+          mkdir -p bin && tar -xzf "$file" -C bin conn3x
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: conn3x version
+      - run: conn3x fmt -check -recursive
+      - name: Validate
+        run: conn3x init -backend=false && conn3x validate
+      - name: Validate the example
+        working-directory: examples/local
+        run: conn3x init -backend=false && conn3x validate
+
+  e2e:
+    needs: validate
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [rocky10, fedora45, ubuntu2404, debian13]
+    name: e2e (${{ matrix.distro }})
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The test host images live in the Conn3x repo.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: conn3xorg/conn3x
+          ref: main
+          path: conn3x
+          persist-credentials: false
+          sparse-checkout: test/images
+      - name: Install Conn3x
+        env: *gh
+        run: *install
+      - name: Start the ${{ matrix.distro }} host
+        working-directory: examples/local
+        env:
+          CONTAINERFILE: ${{ github.workspace }}/conn3x/test/images/${{ matrix.distro }}/Containerfile
+          # Podman in the host container needs a rootful, privileged container.
+          PODMAN: sudo podman
+        run: ./up.sh
+      - name: Apply, then plan again with no changes
+        working-directory: examples/local
+        run: |
+          conn3x init
+          conn3x apply -auto-approve
+          conn3x plan -detailed-exitcode
+      # Checks health, that sign-up is refused, and that the project keys
+      # from headless initialization can send a trace over OTLP and read it
+      # back once the worker has written it to ClickHouse. A wrong secret key
+      # has to be refused. It restarts the whole stack and reads the same
+      # trace again, which needs PostgreSQL, ClickHouse, MinIO and the
+      # generated keys all intact. Some test hosts have no curl, so the
+      # check is Node in the web container, which shares the host's network.
+      - name: Check health, sign-up, a trace, and a restart
+        run: |
+          check() { sudo podman exec -i circuit-langfuse podman exec -i -e "TID=$1" langfuse-web node --input-type=module -; }
+          js=$(cat <<'JS'
+          const u = "http://127.0.0.1:3000";
+          const as = (s) => ({ Authorization: "Basic " + Buffer.from(`pk-lf-example:${s}`).toString("base64") });
+          const key = as("sk-lf-example-not-secret");
+          const fail = (m) => { console.error(m); process.exit(1); };
+          const health = await (await fetch(`${u}/api/public/health`)).json();
+          if (health.status !== "OK") fail(`health: ${JSON.stringify(health)}`);
+          let tid = process.env.TID;
+          if (!tid) {
+            const s = await fetch(`${u}/api/auth/signup`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "Eve", email: "eve@example.com", password: "password-123" }) });
+            const st = await s.text();
+            if (s.ok || !st.includes("Sign up is disabled")) fail(`signup: ${s.status} ${st}`);
+            tid = crypto.randomUUID().replaceAll("-", "");
+            const now = `${Date.now()}000000`;
+            const span = { traceId: tid, spanId: tid.slice(0, 16), name: "ci-check", kind: 1, startTimeUnixNano: now, endTimeUnixNano: now, attributes: [{ key: "langfuse.observation.input", value: { stringValue: "hello from ci" } }] };
+            const body = JSON.stringify({ resourceSpans: [{ resource: { attributes: [{ key: "service.name", value: { stringValue: "ci" } }] }, scopeSpans: [{ scope: { name: "ci" }, spans: [span] }] }] });
+            const i = await fetch(`${u}/api/public/otel/v1/traces`, { method: "POST", headers: { ...key, "Content-Type": "application/json", "x-langfuse-ingestion-version": "4" }, body });
+            if (!i.ok) fail(`ingest: ${i.status} ${await i.text()}`);
+            const w = await fetch(`${u}/api/public/v2/observations?traceId=${tid}`, { headers: as("sk-lf-wrong") });
+            if (w.status !== 401) fail(`wrong key answered ${w.status}`);
+          }
+          for (let n = 0; n < 120; n++) {
+            const r = await fetch(`${u}/api/public/v2/observations?traceId=${tid}&fields=core,basic,io`, { headers: key });
+            const t = await r.text();
+            if (r.ok && t.includes('"ci-check"') && t.includes("hello from ci")) { console.log(tid); process.exit(0); }
+            await new Promise((ok) => setTimeout(ok, 1000));
+          }
+          fail(`trace ${tid} not found`);
+          JS
+          )
+          tid=$(printf '%s' "$js" | check "")
+          sudo podman exec circuit-langfuse systemctl restart langfuse-clickhouse langfuse-minio langfuse-worker langfuse-web
+          for _ in $(seq 60); do printf '%s' "$js" | check "$tid" && break; sleep 5; done
+          printf '%s' "$js" | check "$tid"
+          echo "All checks passed."
+      - name: Clean up
+        if: always()
+        working-directory: examples/local
+        env:
+          PODMAN: sudo podman
+        run: ./down.sh
